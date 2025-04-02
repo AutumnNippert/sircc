@@ -5,29 +5,40 @@ import (
     "net"
 	"strings"
 	"time"
+    "log"
+    "os"
 	
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
-var server string = "irc.myserver.com"
+var server string = "irc.autumnnippert.com"
 var port string = "6667"
-var nick string = "test"
-var user string = "test"
-var realname string = "test"
+var nick string = "card"
+var user string = "card"
+var realname string = "card"
+
+var connected_channels []string
+var channel_outputs map[string]*tview.TextView
 
 var curr_channel string = ""
+var curr_output *tview.TextView
+var input *tview.InputField
+
 var close bool = false
 
 func join(conn net.Conn, channel string) {
 	fmt.Fprintf(conn, "JOIN %s\r\n", channel)
+    log.Printf("Sending JOIN %s\r\n", channel)
 }
+
 func part(conn net.Conn, channel string, message string) {
 	if message == "" {
 		message = "Bye"
 	}
 	fmt.Fprintf(conn, "PART %s :%s\r\n", channel, message)
 }
+
 func msg(conn net.Conn, channel string, message string) {
 	fmt.Fprintf(conn, "PRIVMSG %s :%s\r\n", channel, message)
 }
@@ -89,6 +100,15 @@ func parse_input(conn net.Conn, line, curr_channel string, stopApp func()) (stri
 			return "", output
 		}
 		output = append(output, "[red]You're not in a channel")
+    case "/switch":
+        // switch to another channel or a private message if nick exists
+        if len(tokens) >= 2 {
+            channel := tokens[1]
+            conn.Write([]byte(fmt.Sprintf("JOIN %s\r\n", channel)))
+            output = append(output, fmt.Sprintf("[green]Switching to %s", channel))
+            return channel, output
+        }
+        output = append(output, "[red]Usage: /switch #channel")
 	default:
 		if curr_channel == "" {
 			output = append(output, "[red]Join a channel first with /join #channel")
@@ -101,9 +121,23 @@ func parse_input(conn net.Conn, line, curr_channel string, stopApp func()) (stri
 	return curr_channel, output
 }
 
+func init_logging(){
+    // Open the log file
+    f, err := os.OpenFile("irc.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer f.Close()
+
+    // Set the log output to the file
+    log.SetOutput(f)
+}
+
 var output *tview.TextView
 
 func main() {
+    init_logging()
+    
 	app := tview.NewApplication()
 	app.EnableMouse(true)
 
@@ -133,10 +167,35 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
+    
+    // connect to server
+    // output[0] is "app", 
 	fmt.Fprintf(conn, "NICK %s\r\n", nick)
 	fmt.Fprintf(conn, "USER %s 0 * :%s\r\n", user, user, realname)
 
+
+
+    // check if server said username taken or not
+    buf := make([]byte, 4096)
+    n, err := conn.Read(buf)
+    if err != nil {
+        panic(err)
+    }
+    lines := strings.Split(string(buf[:n]), "\r\n")
+    for _, line := range lines {
+        if strings.Contains(line, "433") {
+            output.Write([]byte("[red]Username taken, please try again\n"))
+            log.Printf("Username taken, please try again\n")
+            app.Stop()
+            return
+        }
+        if strings.Contains(line, "001") {
+            output.Write([]byte("[green]Connected to server\n"))
+            log.Printf("Connected to server %s\n", server_str)
+            break
+        }
+    }
+    
 	// --- Reader goroutine
 	go func() {
 		buf := make([]byte, 4096)
