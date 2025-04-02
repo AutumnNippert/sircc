@@ -1,14 +1,20 @@
 package main
 
 import (
-	"bufio"
     "fmt"
     "net"
-    "io"
-	"os"
 	"strings"
 	"time"
+	
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
+
+var server string = "irc.myserver.com"
+var port string = "6667"
+var nick string = "test"
+var user string = "test"
+var realname string = "test"
 
 var curr_channel string = ""
 var close bool = false
@@ -33,100 +39,144 @@ func get_time() string {
 	return t.Format("02-01-2006 15:04:05")
 }
 
-func parse_response(line string) {
+func parse_response(line string) string {
 	tokens := strings.Fields(line)
-	// So basically the first token is the user or the server
+	if len(tokens) < 2 {
+		return fmt.Sprintf("%19s | %s\n", get_time(), line)
+	}
+
 	user := tokens[0]
-	// try split by !
 	if strings.Contains(user, "!") {
 		user = strings.Split(user, "!")[0][1:]
 	}
-
-	if tokens[1] == "PRIVMSG" {
-		tokens[3] = strings.Trim(tokens[3], ":")
-		
-		fmt.Printf("%19s | %s: %s\n", get_time(), user, strings.Join(tokens[3:], " "))
-	
-	} else {
-		fmt.Printf("%19s | %s\n", get_time(), line)
+	if strings.HasPrefix(user, ":") {
+		user = user[1:]
 	}
+
+	if tokens[1] == "PRIVMSG" && len(tokens) >= 4 {
+		msg := strings.Join(tokens[3:], " ")
+		msg = strings.TrimPrefix(msg, ":")
+		return fmt.Sprintf("%19s | [green]%s[-]: %s", get_time(), user, msg)
+	}
+	return fmt.Sprintf("%19s | %s", get_time(), line)
 }
 
-func handle_user_input(conn net.Conn, line string) {
+func parse_input(conn net.Conn, line, curr_channel string, stopApp func()) (string, []string) {
+	var output []string
 	tokens := strings.Fields(line)
+
 	if len(tokens) == 0 {
-		return
+		return curr_channel, nil
 	}
 
-	// parse commands
 	switch tokens[0] {
 	case "/quit":
-		fmt.Println("Disconnecting...")
-		part(conn, curr_channel, "Bye")
-		close = true
-		return
+		conn.Write([]byte("QUIT :bye\r\n"))
+		stopApp()
+		output = append(output, "[yellow]Quitting...")
 	case "/join":
-		if len(tokens) < 2 {
-			fmt.Println("Usage: /join <channel>")
-			return
+		if len(tokens) >= 2 {
+			channel := tokens[1]
+			conn.Write([]byte(fmt.Sprintf("JOIN %s\r\n", channel)))
+			output = append(output, fmt.Sprintf("[green]Joining %s", channel))
+			return channel, output
 		}
-		channel := tokens[1]
-		join(conn, channel)
-		curr_channel = channel
-		return
+		output = append(output, "[red]Usage: /join #channel")
 	case "/part":
-		if curr_channel == "" {
-			fmt.Println("You are not in a channel.")
-			return
+		if curr_channel != "" {
+			conn.Write([]byte(fmt.Sprintf("PART %s :leaving\r\n", curr_channel)))
+			output = append(output, fmt.Sprintf("[yellow]Parted %s", curr_channel))
+			return "", output
 		}
-		part(conn, curr_channel, "")
-		curr_channel = ""
-		return
+		output = append(output, "[red]You're not in a channel")
+	default:
+		if curr_channel == "" {
+			output = append(output, "[red]Join a channel first with /join #channel")
+		} else {
+			conn.Write([]byte(fmt.Sprintf("PRIVMSG %s :%s\r\n", curr_channel, line)))
+			output = append(output, fmt.Sprintf("[white]%19s | [blue]To %s: %s", get_time(), curr_channel, line))
+		}
 	}
-	// if no command, send as message
 
-	if curr_channel == "" {
-		fmt.Println("You are not in a channel. Use /join <channel> to join a channel.")
-		return
-	}
-	fmt.Fprintf(conn, "PRIVMSG %s :%s\r\n", curr_channel, line)
+	return curr_channel, output
 }
 
+var output *tview.TextView
+
 func main() {
-    conn, err := net.Dial("tcp", "irc.autumnnippert.com:6667")
-    if err != nil {
-        panic(err)
-    }
-    defer conn.Close()
+	app := tview.NewApplication()
+	app.EnableMouse(true)
 
-    fmt.Fprintf(conn, "NICK card\r\n")
-	fmt.Fprintf(conn, "USER card 0 * :card\r\n")
+	output = tview.NewTextView()
 
-	// --- Reading from IRC server
+	output.
+		SetDynamicColors(true).
+		SetScrollable(true).
+		SetChangedFunc(func() {
+			app.Draw()
+			output.ScrollToEnd()
+		})
+
+	input := tview.NewInputField().
+		SetLabel("> ").
+		SetFieldWidth(0)
+
+	flex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(output, 0, 1, false).
+		AddItem(input, 1, 0, true)
+
+	app.SetRoot(flex, true)
+
+	// Connect to IRC
+	server_str := fmt.Sprintf("%s:%s", server, port)
+	conn, err := net.Dial("tcp", server_str)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Fprintf(conn, "NICK %s\r\n", nick)
+	fmt.Fprintf(conn, "USER %s 0 * :%s\r\n", user, user, realname)
+
+	// --- Reader goroutine
 	go func() {
-		scanner := bufio.NewScanner(conn)
-		for scanner.Scan() {
-			line := scanner.Text()
-			// parse the line
-			parse_response(line)
-		}
-
-		if err := scanner.Err(); err != nil && err != io.EOF {
-			fmt.Fprintln(os.Stderr, "Error reading from server:", err)
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				output.Write([]byte("[red]Disconnected from server\n"))
+				app.Stop()
+				return
+			}
+			lines := strings.Split(string(buf[:n]), "\r\n")
+			for _, line := range lines {
+				if line == "" {
+					continue
+				}
+				if strings.HasPrefix(line, "PING") {
+					// Respond to keepalive
+					pong := "PONG" + line[4:] + "\r\n"
+					conn.Write([]byte(pong))
+				}
+				output.Write([]byte(parse_response(line) + "\n"))
+			}
 		}
 	}()
 
-	// --- Writing user input to server
-	stdin := bufio.NewScanner(os.Stdin)
-	for stdin.Scan() {
-		text := stdin.Text()
-		if text == "" {
-			continue
-		}
-		// handle user input
-		handle_user_input(conn, text)
-		if close {
-			break
-		}
+	
+	input.SetDoneFunc(func(key tcell.Key) {
+			line := input.GetText()
+			input.SetText("")
+		
+			newChannel, feedback := parse_input(conn, line, curr_channel, app.Stop)
+			curr_channel = newChannel
+		
+			for _, msg := range feedback {
+				output.Write([]byte(msg + "\n"))
+			}
+		})
+
+	if err := app.Run(); err != nil {
+		panic(err)
 	}
+
 }
